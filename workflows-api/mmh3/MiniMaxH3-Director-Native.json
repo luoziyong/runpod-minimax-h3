@@ -131,7 +131,7 @@
  },
  "397:16": {
   "inputs": {
-   "unet_name": "Minimax-h3_Singularity_ref2va_Pruned_v1.3_int8.safetensors",
+   "unet_name": "minimax_h3_ref2va_pruned_int8_convrot.safetensors",
    "weight_dtype": "default"
   },
   "class_type": "UNETLoader",
@@ -141,7 +141,7 @@
  },
  "397:2": {
   "inputs": {
-   "clip_name": "qwen3vl_32b_heretic_minimax_h3_nvfp4.safetensors",
+   "clip_name": "qwen3vl_32b_minimax_h3_int8_convrot.safetensors",
    "type": "minimax",
    "device": "default"
   },
@@ -152,7 +152,7 @@
  },
  "397:3": {
   "inputs": {
-   "vae_name": "minimax_h3_video_vae_fp16.safetensors"
+   "vae_name": "minimax_h3_video_vae_int8_convrot.safetensors"
   },
   "class_type": "VAELoader",
   "_meta": {
@@ -427,7 +427,7 @@
   "inputs": {
    "clear_cache_after_n_frames": 100,
    "multiplier": 2,
-   "keep_model_loaded": true,
+   "keep_model_loaded": false,
    "batch_size": 1,
    "multiplier_list": "",
    "frames": [

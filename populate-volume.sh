@@ -1,71 +1,67 @@
 #!/bin/bash
-# Downloads every file listed in models-manifest.txt onto the network volume.
-# Idempotent (skips existing files) and safe for concurrent workers: a flock
-# on $VOL_ROOT/.populate.lock serializes the pass, so cold workers racing to
-# populate a fresh volume queue up instead of downloading in parallel.
-#
-# Env:
-#   VOL_ROOT   mount point of the network volume   (default /runpod-volume)
-#   MANIFEST   path to models-manifest.txt         (default: next to this script)
-#   HF_TOKEN   optional Hugging Face token for gated repos
-set -uo pipefail
+# Download a GPU-selected three-column manifest. Catalog selection is in worker_config.py.
+set -euo pipefail
 
 VOL_ROOT="${VOL_ROOT:-/runpod-volume}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-MANIFEST="${MANIFEST:-$SCRIPT_DIR/models-manifest.txt}"
 M="$VOL_ROOT/models"
-
 if [ ! -d "$VOL_ROOT" ]; then
-    echo "populate: $VOL_ROOT not mounted — nothing to do"
-    exit 0
-fi
-if [ ! -f "$MANIFEST" ]; then
-    echo "populate: manifest not found at $MANIFEST" >&2
+    echo "populate: missing volume $VOL_ROOT" >&2
     exit 1
 fi
-
-# Serialize concurrent populators on the shared volume
+if [ -z "${MANIFEST:-}" ]; then
+    MANIFEST="$(mktemp)"
+    trap 'rm -f "$MANIFEST"' EXIT
+    python3 "$SCRIPT_DIR/worker_config.py" manifest > "$MANIFEST"
+fi
+if [ ! -s "$MANIFEST" ]; then
+    echo "populate: missing or empty selected manifest $MANIFEST" >&2
+    exit 1
+fi
 exec 9>"$VOL_ROOT/.populate.lock"
 flock 9
-
-echo "populate: free space on $VOL_ROOT: $(df -h "$VOL_ROOT" | awk 'NR==2{print $4" of "$2}')"
-total=$(grep -vc '^\s*\(#\|$\)' "$MANIFEST")
-done_n=0
 mkdir -p "$M"
-
-while IFS=$'\t' read -r sub name url; do
+failed=0
+while IFS=$'\t' read -r sub name url extra; do
     case "$sub" in ''|\#*) continue;; esac
-    done_n=$((done_n + 1))
+    if [ -n "${extra:-}" ] || [ -z "$url" ]; then
+        echo "populate: expected a selected three-column manifest; use worker_config.py manifest" >&2
+        exit 1
+    fi
+    case "$sub/$name" in /*|*../*) echo "populate: invalid destination" >&2; exit 1;; esac
     dest="$M/$sub/$name"
-    if [ -f "$dest" ]; then
-        echo "populate: [$done_n/$total] skip $name (present)"
+    if [ -s "$dest" ]; then
+        echo "populate: present $sub/$name"
         continue
     fi
-    echo "populate: [$done_n/$total] downloading $name -> models/$sub/"
     mkdir -p "$M/$sub"
+    echo "populate: downloading $sub/$name"
     ok=0
     if command -v hf >/dev/null 2>&1 && [[ "$url" =~ ^https://huggingface\.co/ ]]; then
-        # Plain hf_transfer HTTP path — xet stages chunks on the container
-        # disk (30GB cap) and dies with EDQUOT on multi-GB files.
         repo_id=$(echo "$url" | awk -F/ '{print $4"/"$5}')
         repo_path=$(echo "$url" | sed -E 's#https?://[^/]+/[^/]+/[^/]+/resolve/[^/]+/(.+)#\1#')
         tmp_dir="$M/$sub/.tmp_hf_$name"
-        rm -rf "$tmp_dir"; mkdir -p "$tmp_dir"
+        mkdir -p "$tmp_dir"
         export HF_HUB_ENABLE_HF_TRANSFER=1 HF_HUB_DISABLE_XET=1
-        if hf download "$repo_id" "$repo_path" --local-dir "$tmp_dir" && [ -f "$tmp_dir/$repo_path" ]; then
-            mv -f "$tmp_dir/$repo_path" "$dest"; ok=1
+        if hf download "$repo_id" "$repo_path" --local-dir "$tmp_dir" && [ -s "$tmp_dir/$repo_path" ]; then
+            mv -f "$tmp_dir/$repo_path" "$dest"
+            rm -rf "$tmp_dir"
+            ok=1
         fi
-        rm -rf "$tmp_dir"
     fi
     if [ "$ok" = 0 ]; then
-        hdr=()
-        [ -n "${HF_TOKEN:-}" ] && hdr=(--header="Authorization: Bearer $HF_TOKEN")
-        if wget -q --continue --tries=5 --timeout=60 "${hdr[@]}" -O "$dest.tmp" "$url"; then
-            mv "$dest.tmp" "$dest"; ok=1
+        wget_args=(-q --continue --tries=5 --timeout=60 -O "$dest.tmp")
+        [ -z "${HF_TOKEN:-}" ] || wget_args+=(--header="Authorization: Bearer $HF_TOKEN")
+        if wget "${wget_args[@]}" "$url" && [ -s "$dest.tmp" ]; then
+            mv -f "$dest.tmp" "$dest"
         else
-            echo "populate: FAILED $name (kept .tmp for resume) — free space: $(df -h "$M" | awk 'NR==2{print $4}')" >&2
+            echo "populate: FAILED $sub/$name (partial download kept for retry)" >&2
+            failed=$((failed + 1))
         fi
     fi
 done < "$MANIFEST"
-
-echo "populate: done — $M"
+if [ "$failed" -gt 0 ]; then
+    echo "populate: $failed download(s) failed" >&2
+    exit 1
+fi
+echo "populate: selected models ready in $M"

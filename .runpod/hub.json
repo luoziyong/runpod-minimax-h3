@@ -1,14 +1,14 @@
 {
   "title": "MiniMax H3 - Video Generation",
-  "description": "ComfyUI serverless worker for MiniMax H3: text/image/first-last-frame/reference-to-video with audio, lightx2v 8-step turbo LoRAs, TensorRT RIFE interpolation + upscaling, wildcard prompts and a Qwen3-VL enhancer. Models auto-download to your network volume on first boot.",
+  "description": "Generic volume-based MiniMax H3 worker for 32-48GB GPUs. For fixed Ada/5090 images in Runpod's managed registry, import GitHub using the deploy/runpod Dockerfiles. Staged loading, quality/speed presets and optional TensorRT post-processing.",
   "type": "serverless",
   "category": "video",
   "iconUrl": "https://raw.githubusercontent.com/huchukato/runpod-minimax-h3/main/media/icon.png",
   "config": {
     "runsOn": "GPU",
-    "containerDiskInGb": 30,
+    "containerDiskInGb": 50,
     "gpuCount": 1,
-    "gpuIds": "BLACKWELL_96",
+    "gpuIds": "ADA_48_PRO,ADA_32_PRO",
     "allowedCudaVersions": [
       "13.0",
       "13.1",
@@ -20,7 +20,7 @@
         "input": {
           "type": "boolean",
           "name": "Auto-download models",
-          "description": "Download missing models to the attached network volume at worker boot. Requires a ≥160GB network volume attached to the endpoint — strongly recommended.",
+          "description": "Download only the models selected for the visible GPU. Attach a persistent network volume (160GB recommended).",
           "default": true,
           "trueValue": "true",
           "falseValue": "false"
@@ -31,7 +31,7 @@
         "input": {
           "name": "Hugging Face token",
           "type": "string",
-          "description": "Optional — only needed if you edit models-manifest.txt to pull from gated Hugging Face repos. All bundled models are public.",
+          "description": "Optional \u2014 only needed if you edit models-manifest.txt to pull from gated Hugging Face repos. All bundled models are public.",
           "default": "",
           "advanced": true
         }
@@ -53,8 +53,71 @@
         "input": {
           "name": "ComfyUI extra args",
           "type": "string",
-          "description": "Extra launch flags for ComfyUI. Leave empty: --fast / --use-sage-attention / --async-offload corrupt int8-convrot stacks.",
+          "description": "Additional non-conflicting ComfyUI flags. Memory/cache/fast-attention overrides are rejected by the staged profiles.",
           "default": "",
+          "advanced": true
+        }
+      },
+      {
+        "key": "MMH3_GPU_PROFILE",
+        "input": {
+          "type": "string",
+          "name": "MMH3_GPU_PROFILE",
+          "description": "auto, rtx6000_ada_48, l40s_48, pro6000_mig_48 or rtx5090_32. Auto uses the visible GPU/MIG capacity.",
+          "default": "auto"
+        }
+      },
+      {
+        "key": "MMH3_PRESET",
+        "input": {
+          "type": "string",
+          "name": "MMH3_PRESET",
+          "description": "Default preset: quality (20 native steps) or speed (8-step FL2VA / 4-step Ref2VA).",
+          "default": "quality"
+        }
+      },
+      {
+        "key": "MMH3_ENCODER_FAMILY",
+        "input": {
+          "type": "string",
+          "name": "MMH3_ENCODER_FAMILY",
+          "description": "official (default) or heretic. Precision is selected for the GPU architecture.",
+          "default": "official"
+        }
+      },
+      {
+        "key": "MMH3_DOWNLOAD_ENHANCER",
+        "input": {
+          "type": "boolean",
+          "name": "MMH3_DOWNLOAD_ENHANCER",
+          "description": "Download optional Qwen3.5-9B prompt enhancement weights.",
+          "default": false,
+          "trueValue": "true",
+          "falseValue": "false",
+          "advanced": true
+        }
+      },
+      {
+        "key": "MMH3_DOWNLOAD_SINGULARITY",
+        "input": {
+          "type": "boolean",
+          "name": "MMH3_DOWNLOAD_SINGULARITY",
+          "description": "Download optional Singularity v1.3 Pruned INT8.",
+          "default": false,
+          "trueValue": "true",
+          "falseValue": "false",
+          "advanced": true
+        }
+      },
+      {
+        "key": "MMH3_DOWNLOAD_STYLE_LORAS",
+        "input": {
+          "type": "boolean",
+          "name": "MMH3_DOWNLOAD_STYLE_LORAS",
+          "description": "Download optional Realism and Character-Swap LoRAs (Singularity).",
+          "default": false,
+          "trueValue": "true",
+          "falseValue": "false",
           "advanced": true
         }
       }

@@ -6,9 +6,9 @@ input media, queues the prompt, and returns the produced media as base64.
 
 Job input:
   {
-    "workflow": "MiniMaxH3-Turbo-R2VA-GGUF.json",   # file in /opt/workflows
+    "task":     "t2v",                             # or workflow / prompt_graph
     "prompt":   "...",                             # enhancer/directive text
-    "config":   "native|native_turbo|r2va_native|r2va_native_turbo|10eros|10eros_turbo",
+    "preset":   "quality",                         # quality | speed
     "camera_tag": "[ORBIT]",                       # optional
     "seconds":  6,                                 # optional duration override
     "images":   ["https://... or base64"],         # optional, fills LoadImage nodes in id order
@@ -24,6 +24,7 @@ import os
 import random
 import re
 import shutil
+import shlex
 import subprocess
 import threading
 import time
@@ -32,15 +33,15 @@ import urllib.parse
 import uuid
 from pathlib import Path
 
-import runpod
+from worker_config import env_bool, load_runtime, normalize_job
+from workflow_runtime import compile_workflow, validate_memory_stages, validate_model_files
 
 COMFY_DIR = os.environ.get("COMFYUI_DIR", "/workspace/runpod-slim/ComfyUI")
 COMFY_URL = "http://127.0.0.1:8188"
 WORKFLOWS_DIR = Path(os.environ.get("WORKFLOWS_DIR", "/opt/workflows"))
 JOB_TIMEOUT_S = int(os.environ.get("JOB_TIMEOUT_S", "1800"))
 
-# Workflows boot-synced from the ForgeHub repo override the baked copies, so a
-# workflow edit lands at the next cold boot without rebuilding the image.
+# Optional ForgeHub sync overrides baked copies only when explicitly enabled.
 FH_REPO = os.environ.get("FORGEHUB_REPO", "huchukato/ForgeHub")
 FH_BRANCH = os.environ.get("FORGEHUB_BRANCH", "main")
 FH_ENDPOINT = os.environ.get("FORGEHUB_ENDPOINT_NAME", "MiniMax H3")
@@ -53,14 +54,14 @@ INLINE_MAX = int(os.environ.get("OUTPUT_INLINE_MAX_MB", "10")) * 1024 * 1024
 INLINE_BUDGET = int(os.environ.get("OUTPUT_INLINE_BUDGET_MB", "15")) * 1024 * 1024
 S3_PREFIX = os.environ.get("S3_OUTPUT_PREFIX", "outputs")
 
-# Config → unet filename needle + sampler values (mirrors chat_service.py _MINIMAX_CONFIGS)
+# Legacy widget patching; workflow_runtime owns the final model and schedule.
 MINIMAX_CONFIGS = {
     "native":            {"unet": "fl2va",  "steps": 20, "sampler": "res_multistep", "scheduler": "simple", "shift_video": 12.0, "shift_audio": 3.0, "lora": None, "tau": None},
     "native_turbo":      {"unet": "fl2va",  "steps": 8,  "sampler": "euler",         "scheduler": "simple", "shift_video": 6.0,  "shift_audio": 3.0, "lora": "fl2v_turbo",  "tau": 1.3},
+    "r2va_native":       {"unet": "ref2va", "steps": 20, "sampler": "res_multistep", "scheduler": "simple", "shift_video": 12.0, "shift_audio": 3.0, "lora": None, "tau": None},
+    "r2va_native_turbo": {"unet": "ref2va", "steps": 4, "sampler": "euler", "scheduler": "simple", "shift_video": 12.0, "shift_audio": 3.0, "lora": "ref2v_turbo_4step", "tau": 1.3},
     "r2va_singularity":       {"unet": "Singularity", "steps": 20, "sampler": "res_multistep", "scheduler": "simple", "lora": None, "tau": None, "sigma_off": True},
     "r2va_singularity_turbo": {"unet": "Singularity", "steps": 6,  "sampler": "euler",         "scheduler": "beta",   "lora": "ref2v_turbo_4step", "tau": 1.3, "sigma_off": True},
-    "10eros":            {"unet": "10eros", "steps": 20, "sampler": "res_multistep", "scheduler": "simple", "shift_video": 12.0, "shift_audio": 3.0, "lora": None, "tau": None},
-    "10eros_turbo":      {"unet": "10eros", "steps": 8,  "sampler": "euler",         "scheduler": "simple", "shift_video": 6.0,  "shift_audio": 3.0, "lora": "fusion_turbo", "tau": 1.3},
 }
 
 
@@ -78,17 +79,24 @@ def _http(path, payload=None, timeout=30):
 
 _BOOT_DONE = threading.Event()
 _BOOT_ERR = None
+_JOB_LOCK = None
 
 
 def _boot_comfy():
-    # Extra flags come from COMFYUI_EXTRA_ARGS (space-separated). Keep the
-    # default empty: --fast/--use-sage-attention/--async-offload corrupt the
-    # int8-convrot Qwen/MMh3 stacks (flat garbage output).
+    runtime = load_runtime()
+    extra = shlex.split(os.environ.get("COMFYUI_EXTRA_ARGS", ""))
+    conflicting = ("--fast", "--gpu-only", "--highvram", "--lowvram", "--novram", "--normalvram",
+                   "--cpu", "--async-offload", "--cache-", "--vram-headroom", "--listen", "--port",
+                   "--use-sage-attention", "--use-ck-attention", "--use-flash-attention",
+                   "--enable-dynamic-vram", "--reserve-vram", "--preview-method")
+    if any(arg.startswith(conflicting) for arg in extra):
+        raise ValueError("COMFYUI_EXTRA_ARGS conflicts with the staged INT8 profiles; remove memory/cache/attention overrides")
     cmd = [
         "python3", "main.py",
         "--listen", "127.0.0.1", "--port", "8188",
         "--disable-auto-launch",
-    ] + os.environ.get("COMFYUI_EXTRA_ARGS", "").split()
+        "--use-pytorch-cross-attention", "--disable-xformers",
+    ] + runtime["extra_args"] + extra
     comfy_log = open("/workspace/comfy.log", "ab", buffering=0)
     proc = subprocess.Popen(cmd, cwd=COMFY_DIR, stdout=comfy_log, stderr=subprocess.STDOUT)
     deadline = time.time() + 600
@@ -97,13 +105,21 @@ def _boot_comfy():
             raise RuntimeError("ComfyUI exited during boot")
         try:
             _http("/system_stats", timeout=5)
-            return proc
         except Exception:
             time.sleep(2)
+            continue
+        info = json.loads(_http("/object_info", timeout=30))
+        required = {"MMH3StageBarrier", "MMH3StageGate", "MMH3TensorRTLoader", "VAEDecodeTiled"}
+        missing = required - info.keys()
+        if missing:
+            raise RuntimeError(f"Required staged-loading nodes failed to import: {sorted(missing)}")
+        return proc
     raise RuntimeError("ComfyUI did not become ready in 600s")
 
 
 def _sync_workflows():
+    if not env_bool("WORKFLOW_SYNC_ENABLED"):
+        return
     try:
         req = urllib.request.Request(
             f"https://api.github.com/repos/{FH_REPO}/git/trees/{FH_BRANCH}?recursive=1",
@@ -180,7 +196,10 @@ def _load_workflow(name):
     """Workflow templates must be saved in ComfyUI *API format* (Export API),
     where every node is keyed by id and inputs carry widget names — the UI
     format's positional widgets_values can't be patched reliably."""
-    dirs = [WF_SYNC_DIR, WORKFLOWS_DIR] if WF_SYNC_MANIFEST.is_file() else [WORKFLOWS_DIR]
+    if not name or Path(name).name != name:
+        raise ValueError("workflow must be a template filename, not a path")
+    dirs = ([WF_SYNC_DIR, WORKFLOWS_DIR]
+            if env_bool("WORKFLOW_SYNC_ENABLED") and WF_SYNC_MANIFEST.is_file() else [WORKFLOWS_DIR])
     for base in dirs:
         path = base / name
         if not path.is_file():
@@ -223,8 +242,8 @@ def _director_timeline(job):
     The form gives the charsheet (images[0]), the segment ideas one per line in
     `prompt`, an optional style prose in `global_prompt`, and `seconds` split evenly
     across the ideas. The subject description comes from the form or is auto-generated
-    by the Analyze route; each idea is then expanded by the Enhance route — the same
-    built-in QwenVL the canvas buttons use — when `enhance` is on (default).
+    by the Analyze route when requested; each idea can be expanded by the Enhance
+    route. Both optional VLM operations default to off.
 
     The charsheet travels INSIDE the timeline (subjects[0].images as b64) — the
     Director's API graph has no LoadImage; that is how load_ref_image_tensors reads it.
@@ -244,12 +263,14 @@ def _director_timeline(job):
     # context and the compiled prompt's first lines carry it.
     global_prompt = "\n".join(x for x in (_job_style_text(job), str(job.get("global_prompt") or "")) if x.strip())
 
-    seconds = int(job.get("seconds") or 10)
-    per = max(1, round(seconds / len(ideas)))
+    seconds = int(job.get("seconds") or 5)
+    total = seconds * 24
+    if len(ideas) > total:
+        raise ValueError("Director has more segments than timeline frames")
 
     subject_desc = (job.get("subject_description") or "").strip()
     retention = ""
-    if not subject_desc and char_b64:
+    if job.get("analyze", False) and not subject_desc and char_b64:
         res = _comfy_route("/minimax_director/analyze_character", {
             "image_b64": char_b64, "char_index": 0, "kind": "person",
             "provider": "qwenvl", "base_url": "", "model": "",
@@ -260,10 +281,11 @@ def _director_timeline(job):
 
     fps = 24
     segments = []
-    cursor = 0
-    for idea in ideas:
+    for index, idea in enumerate(ideas):
+        start = index * total // len(ideas)
+        end = (index + 1) * total // len(ideas)
         text = idea
-        if job.get("enhance", True) and char_b64:
+        if job.get("enhance", False) and char_b64:
             res = _comfy_route("/minimax_director/enhance_segment", {
                 "image_b64": char_b64, "segment_text": idea,
                 "global_prompt": global_prompt,
@@ -272,12 +294,9 @@ def _director_timeline(job):
             if res.get("status") == "success" and (res.get("text") or "").strip():
                 text = res["text"].strip()
         segments.append({
-            "id": uuid.uuid4().hex, "start": cursor * fps, "length": per * fps,
+            "id": uuid.uuid4().hex, "start": start, "length": end - start,
             "prompt": text, "type": "text", "isEndFrame": False,
         })
-        cursor += per
-
-    total = cursor * fps
     ref_raw = str(job.get("reference_mode") or "REF2VA")
     ref_mode = "OFF" if ref_raw.strip().lower().startswith("off") else "REF2VA"
     tdata = {
@@ -326,15 +345,19 @@ def _patch(prompt, job):
     if director_nodes and cfg:
         cfg = {**cfg, "unet": None}
     base = re.sub(r"[^\w.-]+", "-", str(job.get("job_name") or f"job_{uuid.uuid4().hex[:8]}")).strip("-")
-    images = [_upload(f"{base}_{i}.png", _media_bytes(v)) for i, v in enumerate(job.get("images") or [])]
+    needs_uploads = any("LoadImage" in n.get("class_type", "") for n in prompt.values())
+    images = ([_upload(f"{base}_{i}.png", _media_bytes(v)) for i, v in enumerate(job.get("images") or [])]
+              if needs_uploads else [])
     video_name = None
     if job.get("video"):
         video_name = _upload(f"{base}.mp4", _media_bytes(job["video"]))
 
     def _find_file(kind, needle):
-        """Locate a model file under the volume + local model dirs."""
+        """Locate model files in the configured storage and ComfyUI model dirs."""
+        models_dir = load_runtime()["models_dir"]
         hits = sorted(
-            h for pat in (f"/runpod-volume/models/{kind}/**/*", f"{COMFY_DIR}/models/{kind}/**/*")
+            h for pat in (f"{models_dir}/{kind}/**/*",
+                          f"{COMFY_DIR}/models/{kind}/**/*")
             for h in glob.glob(pat, recursive=True)
             if needle.lower() in Path(h).name.lower())
         # "fl2va"/"ref2va" needles must not grab 10Eros files which also contain them
@@ -414,7 +437,6 @@ def _patch(prompt, job):
                 # node entirely below (ComfyUI validates lora_name even at
                 # strength 0), so mark it for removal.
                 sel = job.get("lora") or "none"
-                drop_lora = nid
                 if sel != "none":
                     needle = {"realism": "realism", "char_swap": "character_swap"}.get(sel, sel)
                     found = _find_file("loras", needle)
@@ -424,6 +446,8 @@ def _patch(prompt, job):
                     for skey in ("strength_model", "strength_clip"):
                         if skey in inp:
                             inp[skey] = 1.0
+                else:
+                    drop_lora = nid
             elif cfg is not None:
                 if cfg["lora"]:
                     found = _find_file("loras", cfg["lora"])
@@ -687,21 +711,52 @@ def _apply_node_params(prompt, params):
 def _interrupt_prompt(prompt_id):
     """Best-effort ComfyUI abort for a cancelled job: dequeue if pending,
     interrupt if mid-flight."""
-    for path, payload in (("/queue", {"delete": [prompt_id]}), ("/interrupt", {})):
+    queue_payload = {"delete": [prompt_id]} if prompt_id else {"clear": True}
+    for path, payload in (("/queue", queue_payload), ("/interrupt", {})):
         try:
             _http(path, payload, timeout=5)
         except Exception as exc:
             print(f"[handler] {path} failed during cancel: {exc}", flush=True)
 
 
+async def _submit_prompt(prompt):
+    # A cancelled to_thread call can still enqueue work. Wait for the submission
+    # response before releasing the GPU lock, then abort the returned prompt.
+    client_id = uuid.uuid4().hex
+    submission = asyncio.create_task(asyncio.to_thread(
+        _http, "/prompt", {"prompt": prompt, "client_id": client_id}, 60))
+    cancelled = False
+    while not submission.done():
+        try:
+            await asyncio.shield(submission)
+        except asyncio.CancelledError:
+            cancelled = True
+        except Exception:
+            break
+    try:
+        resp = json.loads(submission.result())
+    except Exception:
+        # The server may have accepted the prompt before the connection failed.
+        # This worker owns the queue, so clear and interrupt any unknown work.
+        await _finish_abort(None)
+        if cancelled:
+            raise asyncio.CancelledError()
+        raise
+    if "prompt_id" not in resp:
+        if cancelled:
+            raise asyncio.CancelledError()
+        raise RuntimeError(f"ComfyUI rejected workflow: {json.dumps(resp, ensure_ascii=False)[:2000]}")
+    if cancelled:
+        await _finish_abort(resp["prompt_id"])
+        raise asyncio.CancelledError()
+    return resp["prompt_id"]
+
+
 async def _queue_and_wait(prompt):
     # Async + awaited sleeps: the runpod SDK stops a job by cancelling its
     # task, so the CancelledError can only be delivered at an await — a sync
     # handler would freeze the event loop and never see the stop signal.
-    client_id = uuid.uuid4().hex
-    resp = json.loads(await asyncio.to_thread(
-        _http, "/prompt", {"prompt": prompt, "client_id": client_id}, 60))
-    prompt_id = resp["prompt_id"]
+    prompt_id = await _submit_prompt(prompt)
     deadline = time.time() + JOB_TIMEOUT_S
     try:
         while time.time() < deadline:
@@ -716,9 +771,58 @@ async def _queue_and_wait(prompt):
     except asyncio.CancelledError:
         # Even if this await gets cancelled again, the orphan thread still
         # completes and ComfyUI gets interrupted.
-        await asyncio.to_thread(_interrupt_prompt, prompt_id)
+        await _finish_abort(prompt_id)
         raise
+    except Exception:
+        await _finish_abort(prompt_id)
+        raise
+    await _finish_abort(prompt_id)
     raise TimeoutError(f"prompt {prompt_id} exceeded {JOB_TIMEOUT_S}s")
+
+
+def _abort_and_wait(prompt_id):
+    global _BOOT_ERR
+    _interrupt_prompt(prompt_id)
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        try:
+            queue = json.loads(_http("/queue", timeout=5))
+            if not queue.get("queue_running") and not queue.get("queue_pending"):
+                return
+        except Exception:
+            pass
+        time.sleep(1)
+    _BOOT_ERR = RuntimeError("ComfyUI did not become idle after abort; restart this worker before another job")
+
+
+async def _finish_abort(prompt_id):
+    # A second SDK cancellation must not release the job lock while CUDA work
+    # from the first job is still running.
+    cleanup = asyncio.create_task(asyncio.to_thread(_abort_and_wait, prompt_id))
+    while not cleanup.done():
+        try:
+            await asyncio.shield(cleanup)
+        except asyncio.CancelledError:
+            continue
+    cleanup.result()
+
+
+async def _prepare_prompt(graph, inputs):
+    # _patch can call the Director's local VLM routes. Cancelling to_thread does
+    # not stop that thread, so keep the GPU job lock until preprocessing ends.
+    prepare = asyncio.create_task(asyncio.to_thread(_patch, graph, inputs))
+    cancelled = False
+    while not prepare.done():
+        try:
+            await asyncio.shield(prepare)
+        except asyncio.CancelledError:
+            cancelled = True
+    try:
+        result = prepare.result()
+    finally:
+        if cancelled:
+            raise asyncio.CancelledError()
+    return result
 
 
 def _s3_cfg(job):
@@ -818,37 +922,56 @@ def _collect_outputs(history_entry, prompt, job, inline_used):
     return out, texts
 
 
-async def handler(job):
+async def _handle_job(job):
     print(f"[handler] job {job.get('id')} received", flush=True)
     inputs = job.get("input") or {}
     if inputs.get("action") == "health":
-        # Hub smoke test: answers 200 without touching ComfyUI or models, so it
-        # also works on an endpoint deployed without the network volume.
+        # Report boot progress without waiting for the GPU job lock.
         return {
             "status": "ok",
             "comfyui": "failed" if _BOOT_ERR else ("ready" if _BOOT_DONE.is_set() else "booting"),
             "comfyui_error": str(_BOOT_ERR) if _BOOT_ERR else None,
             "workflows": sorted({p.name for d in (WF_SYNC_DIR, WORKFLOWS_DIR) for p in d.glob("*.json")}),
-            "volume_mounted": os.path.isdir("/runpod-volume"),
+            "model_source": os.environ.get("MMH3_MODEL_SOURCE", "volume"),
+            "volume_mounted": (os.environ.get("MMH3_MODEL_SOURCE", "volume") in ("volume", "hybrid")
+                               and os.path.isdir(os.environ.get("VOL_ROOT", "/runpod-volume"))),
+            "runtime": _health_runtime(),
         }
     # Any real workload needs ComfyUI — wait for the background boot first.
     await _ensure_comfy()
+    runtime = load_runtime()
+    inputs = normalize_job(inputs, runtime)
+    if not isinstance(inputs.get("prompt_graph"), dict) and not str(inputs.get("prompt") or "").strip():
+        raise ValueError("prompt is required when using a workflow template")
     _prune_volume_outputs()
     # _patch uploads input media (blocking, up to minutes for video) — run it
     # off-thread so a cancel signal can still be delivered during uploads.
     if isinstance(inputs.get("prompt_graph"), dict):
         # Raw API-format graph shipped inside the job (ForgeHub mode): the same
         # _patch applies — media upload, config preset, unet/lora needle, prompt.
-        prompt = await asyncio.to_thread(_patch, inputs["prompt_graph"], inputs)
+        prompt = await _prepare_prompt(inputs["prompt_graph"], inputs)
     else:
-        wf = _load_workflow(inputs.get("workflow") or "")
-        prompt = await asyncio.to_thread(_patch, wf, inputs)
+        task_workflows = {"t2v": "MiniMaxH3-Turbo-T2VA.json", "i2v": "MiniMaxH3-Turbo-I2VA.json",
+                          "fl2v": "MiniMaxH3-Turbo-FL2VA.json", "r2v": "MiniMaxH3-Turbo-R2VA.json",
+                          "director": "MiniMaxH3-Director-Native.json",
+                          "storyboard": "MiniMaxH3-Director-Storyboard.json"}
+        task = inputs.get("task", "t2v")
+        if not inputs.get("workflow") and task not in task_workflows:
+            raise ValueError(f"Unknown task: {task}")
+        wf = _load_workflow(inputs.get("workflow") or task_workflows[task])
+        prompt = await _prepare_prompt(wf, inputs)
     prompt = _apply_node_params(prompt, inputs.get("params"))
+    prompt, execution = compile_workflow(prompt, inputs, runtime)
+    validate_model_files(prompt, runtime, COMFY_DIR)
+    print(f"[handler] resolved execution: {json.dumps(execution)}", flush=True)
     print(f"[handler] queuing prompt ({len(prompt)} nodes)", flush=True)
     started = time.time()
     comfy_log = Path("/workspace/comfy.log")
     log_mark = comfy_log.stat().st_size if comfy_log.is_file() else 0
     history = await _queue_and_wait(prompt)
+    stages = [stage for value in history.get("outputs", {}).values()
+              for stage in value.get("mmh3_memory", [])]
+    validate_memory_stages(stages, execution)
     print(f"[handler] comfy execution took {time.time() - started:.1f}s", flush=True)
     inline_used = [0]
     outputs, texts = await asyncio.to_thread(_collect_outputs, history, prompt, job, inline_used)
@@ -865,9 +988,36 @@ async def handler(job):
         outputs = _collect_new_files(started, job, inline_used)
         print(f"[handler] fallback sweep — {len(outputs)} file(s) in output/", flush=True)
     print(f"[handler] done — {len(outputs)} output(s)", flush=True)
-    return {"outputs": outputs, "texts": texts}
+    execution["elapsed_seconds"] = round(time.time() - started, 3)
+    execution["memory_stages"] = stages
+    return {"outputs": outputs, "texts": texts, "execution": execution}
+
+
+def _health_runtime():
+    try:
+        return load_runtime()
+    except Exception as exc:
+        return {"error": str(exc)}
+
+
+async def handler(job):
+    global _JOB_LOCK
+    if (job.get("input") or {}).get("action") == "health":
+        return await _handle_job(job)
+    if _JOB_LOCK is None:
+        _JOB_LOCK = asyncio.Lock()
+    async with _JOB_LOCK:
+        try:
+            return await _handle_job(job)
+        finally:
+            if _BOOT_DONE.is_set() and _BOOT_ERR is None:
+                try:
+                    await asyncio.to_thread(_http, "/mmh3/release", {}, 30)
+                except Exception as exc:
+                    print(f"[handler] between-job release failed: {exc}", flush=True)
 
 
 if __name__ == "__main__":
     threading.Thread(target=_boot_in_bg, daemon=True).start()
+    import runpod
     runpod.serverless.start({"handler": handler})

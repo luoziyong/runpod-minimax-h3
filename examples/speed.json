@@ -1,0 +1,9 @@
+{
+  "input": {
+    "task": "t2v",
+    "preset": "speed",
+    "prompt": "A slow cinematic tracking shot through a quiet mountain village at sunrise. Warm light, gentle wind, natural ambient sound.",
+    "seconds": 5,
+    "seed": 42
+  }
+}

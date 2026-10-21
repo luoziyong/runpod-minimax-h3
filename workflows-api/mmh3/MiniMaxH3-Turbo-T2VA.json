@@ -102,7 +102,7 @@
   },
   "105:11": {
     "inputs": {
-      "vae_name": "minimax_h3_video_vae_fp16.safetensors"
+      "vae_name": "minimax_h3_video_vae_int8_convrot.safetensors"
     },
     "class_type": "VAELoader",
     "_meta": {
@@ -111,7 +111,7 @@
   },
   "105:13": {
     "inputs": {
-      "clip_name": "qwen3vl_32b_heretic_minimax_h3_nvfp4.safetensors",
+      "clip_name": "qwen3vl_32b_minimax_h3_int8_convrot.safetensors",
       "type": "minimax",
       "device": "default"
     },
@@ -360,7 +360,7 @@
       "quantization": "None (FP16)",
       "attention_mode": "auto",
       "use_torch_compile": false,
-      "keep_model_loaded": true,
+      "keep_model_loaded": false,
       "seed": 1,
       "keep_last_prompt": false,
       "passthrough": false,
@@ -431,7 +431,7 @@
     "inputs": {
       "clear_cache_after_n_frames": 100,
       "multiplier": 2,
-      "keep_model_loaded": true,
+      "keep_model_loaded": false,
       "batch_size": 1,
       "multiplier_list": "",
       "frames": [

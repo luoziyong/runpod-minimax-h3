@@ -1,0 +1,19 @@
+{
+  "repository": "https://github.com/Comfy-Org/ComfyUI",
+  "version": "v0.38.0",
+  "commit": "6b747c0428c343e1417219641db93a4fb7cb69ae",
+  "files": {
+    "graph.py": {
+      "path": "comfy_execution/graph.py",
+      "sha256": "3c2f8f7c5a543f432b63e9e27e480a8fd58098d8b254e25d91781b99a3dfbde1"
+    },
+    "caching.py": {
+      "path": "comfy_execution/caching.py",
+      "sha256": "edc554b1348f4c5dae50c022b061399ab5be5e06872d73c5c1fedca9bba45ce2"
+    },
+    "LICENSE": {
+      "path": "LICENSE",
+      "sha256": "3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986"
+    }
+  }
+}
