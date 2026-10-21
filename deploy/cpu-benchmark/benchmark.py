@@ -19,7 +19,8 @@ def utc_now():
 
 
 def emit(event, **values):
-    print(json.dumps({"event": event, "utc": utc_now(), **values}), flush=True)
+    # Runpod treats bare JSON as structured logs and drops fields without "message".
+    print("MMH3_BENCHMARK " + json.dumps({"event": event, "utc": utc_now(), **values}), flush=True)
 
 
 def hash_file(path):
@@ -69,12 +70,26 @@ def main():
     parser.add_argument("--timeout-seconds", type=int, default=1800)
     parser.add_argument("--hold-seconds", type=int, default=3600)
     parser.add_argument("--output", type=Path, default=Path("/tmp/cpu-startup-result.json"))
+    parser.add_argument("--build-file", type=int, help="Download one manifest index into its own build layer")
     args = parser.parse_args()
     start, start_utc = time.monotonic(), utc_now()
     signal.alarm(args.timeout_seconds)
     manifest = json.loads(args.manifest.read_text())
     root = args.model_root
     root.mkdir(parents=True, exist_ok=True)
+    if args.build_file is not None:
+        if args.source != "hf" or args.hold_seconds != 0 or not 0 <= args.build_file < len(manifest["models"]):
+            parser.error("--build-file requires --source hf, --hold-seconds 0 and a valid model index")
+        model = manifest["models"][args.build_file]
+        path = root / model["subdir"] / model["filename"]
+        if path.exists():
+            raise RuntimeError(f"Build download target already exists: {path}")
+        emit("build_download_start", filename=model["filename"], size=model["size"])
+        elapsed = download(model, root)
+        if path.stat().st_size != model["size"] or hash_file(path) != model["sha256"]:
+            raise RuntimeError(f"Build model size or SHA-256 mismatch: {path}")
+        emit("build_model_verified", filename=model["filename"], download_seconds=elapsed)
+        return
     versions = {}
     for package in ("huggingface_hub", "hf_xet"):
         try:

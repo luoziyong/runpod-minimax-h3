@@ -4,6 +4,8 @@ Both images prepare exactly the same minimal native T2VA quality model set: FL2V
 
 The runtime is identical Python 3.12 amd64 with the same pinned Hugging Face client. The HF image starts with no weights and downloads pinned upstream revisions. The image variant ships original files and does not download weights on startup. Both read and SHA-256 verify every complete file before emitting a flushed `models_ready` JSON event. A timeout prevents an unbounded download attempt. There is no model network volume.
 
+The baked image also downloads directly from Hugging Face during its build, one verified file per layer. Both builds and runtime downloads use the client's HTTP fallback (`HF_HUB_DISABLE_XET=1`) to bound memory on small CPU instances. Log lines have a plain-text prefix so Runpod preserves their full event payload instead of interpreting bare JSON as a structured log with no `message` field.
+
 Use identical CPU Pod size, data center and container disk for both tests. Record submission time, platform download and extraction events, first `benchmark_start` and `models_ready`. Report deployment-to-ready separately from container-to-ready. Include cold versus cached layers, scheduler changes, host identity when visible and any overlapping download/extraction; do not add overlapping phase durations. CPU model-file readiness excludes CUDA, ComfyUI startup and inference.
 
 Build the two Dockerfiles from the repository root and deploy fresh Pods. Save container and system logs before stopping the temporary Pods. The result is also written to `/tmp/cpu-startup-result.json` inside each Pod. Images hold after completion so a platform restart policy does not silently rerun a warm test.
