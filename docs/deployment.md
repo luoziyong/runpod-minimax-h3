@@ -11,7 +11,7 @@
 
 Turbo：T2V/I2V/FL2V 为 8 步，官方 Ref2VA 为 4 步。均默认 5 秒。MIG 的 48GB 实例只有半卡计算资源，不能套用完整 96GB PRO 6000 的耗时。上述默认尺寸是保守起点，仍需真实任务验收；5090 可显式测试 `video_size=1344x768`，失败时降低尺寸/时长，不会自动偷换输出规格。
 
-生产建议主机内存 128GB 和快速本地盘。卷部署建议至少 160GB 持久模型卷；多个显卡配置/编码器家族共用卷或全开可选权重时建议 200GB。低频使用首选下面的 Runpod 单配置混合镜像，网络卷只存放两个 DiT，用完释放。权重下载与 CPU 卸载会消耗系统内存及磁盘空间，不能只看 GPU 显存。
+生产建议主机内存 128GB 和快速本地盘。卷部署建议至少 160GB 持久模型卷；多个显卡配置/编码器家族共用卷或全开可选权重时建议 200GB。低频使用首选下面的 Runpod 单配置混合镜像，网络卷存放两个 DiT，紧凑 Ada 还包含编码器，用完释放。权重下载与 CPU 卸载会消耗系统内存及磁盘空间，不能只看 GPU 显存。
 
 ## 2. 首选：Runpod 构建并托管镜像
 
@@ -21,27 +21,30 @@ Turbo：T2V/I2V/FL2V 为 8 步，官方 Ref2VA 为 4 步。均默认 5 秒。MIG
 
 | 用途 | Dockerfile Path | GPU pool | 固定编码器 | 镜像内权重 |
 | --- | --- | --- | --- | --- |
-| 主配置 | `deploy/runpod/rtx6000_ada_48.Dockerfile` | `ADA_48_PRO` | 官方 INT8 ConvRot | 约 34.47GB |
+| 主配置（紧凑 Ada） | `deploy/runpod/rtx6000_ada_48_compact.Dockerfile` | `ADA_48_PRO` | 官方 INT8 ConvRot，放网络卷 | 两个 VAE、两种 Turbo LoRA |
+| Ada 编码器入镜像版 | `deploy/runpod/rtx6000_ada_48.Dockerfile` | `ADA_48_PRO` | 官方 INT8 ConvRot | 约 34.47GB |
 | 备选配置 | `deploy/runpod/rtx5090_32.Dockerfile` | `ADA_32_PRO` | 官方 NVFP4 AWQ | 约 23.02GB |
 
-以上仅为权重大小，不是最终镜像大小。两个镜像都包含编码器、视频/音频 VAE、两种 Turbo LoRA；不包含两个 DiT。Ada 画质档默认 768p，5090 默认 480p，均保留 quality/speed。
+以上仅为权重大小，不是最终镜像大小。紧凑 Ada 只包含视频/音频 VAE 和两种 Turbo LoRA；其余版本还包含本配置的编码器。所有版本的两个 DiT 均在网络卷。Ada 画质档默认 768p，5090 默认 480p，均保留 quality/speed。
 
 ### 存储安排
 
-- 镜像：`/opt/mmh3-models/models` 中保存五个完整权重文件，构建时生成大小和 SHA-256 清单。
-- 网络卷：`/runpod-volume/models/diffusion_models` 中保存 FL2VA 和 Ref2VA，合计约 **41.94GB**，初次使用建议分配 **80GB**。
+- 镜像：`/opt/mmh3-models/models` 中保存四个完整权重文件（紧凑 Ada）或五个完整权重文件（其余版本），构建时生成大小和 SHA-256 清单。
+- 网络卷：`/runpod-volume/models/diffusion_models` 中保存 FL2VA 和 Ref2VA，合计约 **41.94GB**。紧凑 Ada 还在 `text_encoders` 保存本配置的 INT8 编码器，建议 **120GB** 卷；五权重版本建议 **80GB**。
 - 容器临时盘：模型路径和镜像/卷文件通过符号链接汇合在 `/tmp/mmh3-data/models`。只存工作区、缓存、输出和少量管理文件，**不再把 27GB/16GB 编码器重建到可写盘**。可先用 **50GB** 做部署验收；实际镜像拉取与平台空间分配仍需核对。
 
-这与 GHCR 的分块镜像不同：Runpod 入口使用原始权重文件，启动先校验再建立链接，没有大文件组装。仍要求临时盘至少有 8GiB 可用余量。新网络卷只下载两个 DiT，复用已有卷时跳过现有非空文件。第一次下载和启动可能较慢。
+这与 GHCR 的分块镜像不同：Runpod 入口使用原始权重文件，启动先校验再建立链接，没有大文件组装。仍要求临时盘至少有 8GiB 可用余量。新网络卷按镜像清单下载三个模型（紧凑 Ada）或两个 DiT（其余版本），复用已有卷时跳过现有非空文件。第一次下载和启动可能较慢。
 
 ### 控制台操作
 
 1. 将整理后的代码放到你可访问的 GitHub 仓库。在 Runpod Settings → Connections 连接该仓库。
-2. 在目标 GPU 可用的数据中心创建网络卷，先分配 80GB。两套配置可顺序复用同一卷，但需确认该数据中心有目标 GPU。
-3. Serverless → New Endpoint → **Import Git Repository**，选择仓库、分支和上表对应的 **Dockerfile Path**。两个 Dockerfile 的构建上下文是仓库根目录；本地调试时也使用根目录作为 context。
+2. 在目标 GPU 可用的数据中心创建网络卷，紧凑 Ada 分配 120GB，其余版本分配 80GB。两套配置可顺序复用同一卷，但需确认该数据中心有目标 GPU。
+3. Serverless → New Endpoint → **Import Git Repository**，选择仓库、分支和上表对应的 **Dockerfile Path**。各 Dockerfile 的构建上下文是仓库根目录；本地调试时也使用根目录作为 context。
 4. 选择表中对应 GPU pool、每个 worker 一张卡、Active workers=0、Max workers=1、CUDA 13.0 或更新的兼容版本。绑定网络卷到 `/runpod-volume`，容器盘先配置 50GB，执行超时建议至少 1800 秒。
 5. 保留镜像内置的固定 profile、官方编码器和混合存储设置；可在 Endpoint 中导入 `deploy/rtx6000_ada_48.env` 或 `deploy/rtx5090_32.env` 的相应参数。不要把 profile 改成 `auto`，也不要在同一 Endpoint 中加入另一种编码器架构的 GPU 池。
-6. 部署后查看 Builds 日志，再确认编码器校验、卷中 DiT 下载、`comfyui=ready`，最后提交真实生成任务。
+6. 部署后查看 Builds 日志，再确认镜像模型校验、卷中模型下载、`comfyui=ready`，最后提交真实生成任务。
+
+如果只构建镜像，可先设置 Active workers=0、Max workers=0，暂不创建或绑定卷；推理前再挂载卷并把 Max workers 改为 1。
 
 镜像已设置：
 
@@ -57,15 +60,15 @@ MMH3_LOCAL_ROOT=/tmp/mmh3-data
 
 ### 构建限制与回退
 
-Runpod GitHub 构建要求 **Docker build 步骤在 30 分钟内完成，最终镜像不超过 80GB**。原生混合镜像的模型大小虽低于 80GB，但还需加基础环境和依赖，不能据此保证最终大小或耗时达标。完整构建、上传和测试须看 Builds 结果；这里没有声称已经完成云端构建或 GPU 验收。
+Runpod GitHub 构建要求 **Docker build 步骤在 30 分钟内完成，最终镜像不超过 80GB**。原生混合镜像的模型大小虽低于 80GB，但还需加基础环境和依赖，不能据此保证最终大小或耗时达标。完整构建、上传和测试须看 Builds 结果。2026-10-22 的 Ada 五权重构建已完成模型下载、SHA-256 校验和 OCI 镜像导出，但构建缓存导出触及 30 分钟超时，平台终止构建，镜像没有上传成功。因此 Ada 首选紧凑版，把编码器移到网络卷；它仍只选择同一套 Ada 配置。GPU 推理须另做实测。
 
-若下载模型导致构建超过时间或镜像大小限制，可继续使用 **Runpod 自带镜像仓库**：把 Dockerfile Path 改为根目录的 `Dockerfile`，使用完整模型卷（建议 160GB），设置 `MMH3_MODEL_SOURCE=volume`、`VOLUME_AUTOPOPULATE=true`，并固定对应 GPU profile。此时镜像只含运行环境，全部所选权重在首次启动下载到卷。外部 GHCR 是后续备选，见 [GHCR 部署](ghcr.md)。
+若紧凑版仍超过时间或镜像大小限制，可继续使用 **Runpod 自带镜像仓库**：把 Dockerfile Path 改为根目录的 `Dockerfile`，使用完整模型卷（建议 160GB），设置 `MMH3_MODEL_SOURCE=volume`、`VOLUME_AUTOPOPULATE=true`，并固定对应 GPU profile。此时镜像只含运行环境，全部所选权重在首次启动下载到卷。外部 GHCR 是后续备选，见 [GHCR 部署](ghcr.md)。
 
-根目录的 Core 和基础镜像 digest 已固定；第三方节点仍继承上游分支/标签。基础镜像为公开镜像，构建不调用 GPU 探测、TensorRT 编译或推理。镜像代码和模型都只在构建时准备；冷启动不更新源代码。
+根目录的 Core 和基础镜像 digest 已固定；第三方节点仍继承上游分支/标签。基础镜像为公开镜像，构建不调用 GPU 探测、TensorRT 编译或推理。镜像代码与镜像内权重在构建时准备，卷中模型由启动脚本补齐。冷启动不更新源代码。
 
 ### 代码维护
 
-两个固定配置 Dockerfile 由根目录 `Dockerfile` 生成，公共运行环境只维护一份。修改根目录 Dockerfile 后执行：
+固定配置 Dockerfile 由根目录 `Dockerfile` 生成，公共运行环境只维护一份。修改根目录 Dockerfile 后执行：
 
 ```bash
 python3 scripts/render_runpod_dockerfiles.py
@@ -76,7 +79,7 @@ python3 scripts/render_runpod_dockerfiles.py --check
 
 ```bash
 docker build --platform linux/amd64 \
-  -f deploy/runpod/rtx6000_ada_48.Dockerfile \
+  -f deploy/runpod/rtx6000_ada_48_compact.Dockerfile \
   -t mmh3-runpod:ada .
 
 # 5090 对应改用 deploy/runpod/rtx5090_32.Dockerfile。
@@ -84,7 +87,7 @@ docker build --platform linux/amd64 \
 
 ### 使用完释放
 
-先保存视频和需要的结果，等待队列与任务结束，停止相关 worker 并解除 Endpoint 的卷绑定，再删除网络卷；Pod 使用者需终止 Pod。共享卷时先确认另一套配置也不再使用它。**仅缩容到 0、停止 GPU 或终止 Pod 不会删除网络卷，卷仍计费。** 镜像中的五个权重不受删卷影响，下次新建卷只需重新下载两个 DiT。
+先保存视频和需要的结果，等待队列与任务结束，停止相关 worker 并解除 Endpoint 的卷绑定，再删除网络卷；Pod 使用者需终止 Pod。共享卷时先确认另一套配置也不再使用它。**仅缩容到 0、停止 GPU 或终止 Pod 不会删除网络卷，卷仍计费。** 镜像内权重不受删卷影响。紧凑 Ada 下次新建卷需重新下载编码器和两个 DiT；五权重版本只需重新下载两个 DiT。
 
 [创建卷](https://docs.runpod.io/api-reference-v2/network-volumes/create-a-network-volume)可调用 `POST https://api.runpod.io/v2/network-volumes`；[删除卷](https://docs.runpod.io/api-reference-v2/network-volumes/delete-a-network-volume)示例如下。删除会永久清空卷中数据：
 
@@ -102,7 +105,7 @@ curl -fsS -X DELETE \
 <COMFYUI_DIR>/.mmh3/releases/<镜像代码和依赖指纹>/<GPU缓存键>/
 ```
 
-镜像构建会生成代码哈希清单；启动逐文件校验运行目录，缺失/变更时先准备完整副本，再原子发布。已有旧 Core、自定义节点、模型和虚拟环境保留在原位置；`input/output/user` 通过符号链接共享原数据。运行只使用镜像 Python，不加载旧虚拟环境或旧自定义节点。Runpod 原生镜像中的编码器、VAE、LoRA 通过链接读取，两个 DiT 从 `/runpod-volume/models` 获取，不会向临时盘复制大权重。完整模型卷模式仍读取卷中的全部所选权重。
+镜像构建会生成代码哈希清单；启动逐文件校验运行目录，缺失/变更时先准备完整副本，再原子发布。已有旧 Core、自定义节点、模型和虚拟环境保留在原位置；`input/output/user` 通过符号链接共享原数据。运行只使用镜像 Python，不加载旧虚拟环境或旧自定义节点。Runpod 原生镜像中的 VAE、LoRA 通过链接读取，两个 DiT 从 `/runpod-volume/models` 获取；紧凑 Ada 的编码器也从卷中读取，其余原生版本从镜像读取，不会向临时盘复制大权重。完整模型卷模式仍读取卷中的全部所选权重。
 
 镜像更新会使用新指纹目录；同一版本重复启动复用已校验目录。修复被修改的运行副本时，原副本保留为 `*.previous-*`。复制/发布失败会退出并保留原目录，下一次启动可重试。旧文件和历史版本不会自动删除。
 

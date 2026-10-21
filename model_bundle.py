@@ -20,18 +20,21 @@ RESTORE_RESERVE_BYTES = 8 * 1024 ** 3
 ROOT = Path(__file__).resolve().parent
 
 
-def model_selection(profile, encoder_family="official", volume_diffusion_models=False):
+def model_selection(profile, encoder_family="official", volume_diffusion_models=False, volume_encoder=False):
     # Do not inherit auto detection or optional downloads from the build host.
     runtime = build_runtime(profile, environ={"MMH3_ENCODER_FAMILY": encoder_family})
     rows = selected_models(runtime)
-    volume = [row for row in rows if volume_diffusion_models and row["subdir"] == "diffusion_models"]
+    volume = [row for row in rows
+              if (volume_diffusion_models and row["subdir"] == "diffusion_models")
+              or (volume_encoder and row["subdir"] == "text_encoders")]
     image = [row for row in rows if row not in volume]
     return runtime, image, volume
 
 
-def bake_models(bundle_dir, profile, encoder_family="official"):
-    """Download native image files on a CPU builder; leave only the DiTs on the volume."""
-    runtime, rows, volume = model_selection(profile, encoder_family, volume_diffusion_models=True)
+def bake_models(bundle_dir, profile, encoder_family="official", volume_encoder=False):
+    """Bake native files; keep DiTs and optionally the large encoder on the volume."""
+    runtime, rows, volume = model_selection(profile, encoder_family, volume_diffusion_models=True,
+                                           volume_encoder=volume_encoder)
     bundle_dir = Path(bundle_dir).resolve()
     bundle_dir.mkdir(parents=True, exist_ok=True)
     manifest = bundle_dir / "image-models.txt"
@@ -141,7 +144,7 @@ def validate_bundle(bundle, runtime):
     on_volume = {(model["subdir"], model["filename"]) for model in volume}
     if (actual | on_volume != expected or actual & on_volume
             or len(models) + len(volume) != len(expected)
-            or any(model["subdir"] != "diffusion_models" for model in volume)):
+            or any(model["subdir"] not in ("diffusion_models", "text_encoders") for model in volume)):
         raise ValueError("Image model bundle does not contain exactly the selected models")
     source = "hybrid" if volume else "image"
     if runtime.get("model_source") != source:
@@ -269,6 +272,8 @@ def main():
     bake.add_argument("--profile", required=True, choices=PROFILES)
     bake.add_argument("--encoder-family", default="official", choices=("official", "heretic"))
     bake.add_argument("--bundle-dir", default=BUNDLE_DIR)
+    bake.add_argument("--volume-encoder", action="store_true",
+                      help="Keep the encoder with the DiTs on the volume; bake only VAEs and Turbo LoRAs")
     pack = commands.add_parser("pack", help="Create a Docker build context from downloaded model files")
     pack.add_argument("--models-dir", required=True)
     pack.add_argument("--output", required=True)
@@ -286,7 +291,7 @@ def main():
     restore.add_argument("--runtime-config", required=True)
     args = parser.parse_args()
     if args.action == "bake":
-        bundle = bake_models(args.bundle_dir, args.profile, args.encoder_family)
+        bundle = bake_models(args.bundle_dir, args.profile, args.encoder_family, args.volume_encoder)
         print(f"Native image models ready: {bundle['profile']}; "
               f"{sum(model['size'] for model in bundle['models'])} bytes; no assembly needed at startup")
     elif args.action == "pack":

@@ -39,14 +39,15 @@
 
 | 配置 | Dockerfile Path | GPU pool | 默认编码器 |
 | --- | --- | --- | --- |
-| Ada 主配置 | [`deploy/runpod/rtx6000_ada_48.Dockerfile`](deploy/runpod/rtx6000_ada_48.Dockerfile) | `ADA_48_PRO` | 官方 INT8 ConvRot |
+| Ada 主配置（紧凑版） | [`deploy/runpod/rtx6000_ada_48_compact.Dockerfile`](deploy/runpod/rtx6000_ada_48_compact.Dockerfile) | `ADA_48_PRO` | 官方 INT8 ConvRot，放网络卷 |
+| Ada 编码器入镜像版 | [`deploy/runpod/rtx6000_ada_48.Dockerfile`](deploy/runpod/rtx6000_ada_48.Dockerfile) | `ADA_48_PRO` | 官方 INT8 ConvRot |
 | 5090 备选配置 | [`deploy/runpod/rtx5090_32.Dockerfile`](deploy/runpod/rtx5090_32.Dockerfile) | `ADA_32_PRO` | 官方 NVFP4 AWQ |
 
-每个镜像只包含本配置的编码器、VAE 和 Turbo LoRA，权重约 34.47GB / 23.02GB；两个 DiT 共约 **41.94GB** 放按需创建的网络卷（建议 80GB），用完保存结果并删除卷。镜像中的权重直接校验、链接读取，**不需要在容器临时盘还原大编码器**，可从 50GB 容器盘开始实机验收。缓存和输出应及时另存。
+Ada 首选紧凑版：镜像只打包两个 VAE 和两种 Turbo LoRA，官方 INT8 编码器与两个 DiT 放按需网络卷（建议 **120GB**），用完保存结果并删除卷。Ada 编码器入镜像版及 5090 版分别包含约 34.47GB / 23.02GB 权重，只需为两个 DiT 准备约 41.94GB 空间（建议 80GB 卷）。模型直接校验、链接读取，不需要在容器临时盘还原大编码器；可从 50GB 容器盘开始实机验收。缓存和输出应及时另存。
 
-Runpod GitHub 构建限制为 **Docker build 30 分钟、最终镜像 80GB**，基础环境和依赖也计入最终镜像，需用实际云端构建确认。若超限，可改用根目录 `Dockerfile`，仍由 Runpod 构建托管，全部模型放到按需释放的完整模型卷（建议 160GB）。[GHCR 方案](docs/ghcr.md)保留为后续备选。
+Runpod GitHub 构建限制为 **Docker build 30 分钟、最终镜像 80GB**。2026-10-22 的 Ada 五权重云端构建完成了模型校验，但在导出构建缓存时达到 30 分钟被终止，因此默认改用紧凑版。若仍超限，可改用根目录 `Dockerfile`，全部模型放到按需释放的完整模型卷（建议 160GB）。[GHCR 方案](docs/ghcr.md)保留为后续备选。
 
-Core 固定为 **ComfyUI v0.38.0**，基于固定 digest 的 cu130 镜像，需要 CUDA 13 兼容驱动、单个可见 GPU 和充足系统内存（建议 128GB）。两个 Runpod Dockerfile 从根目录 Dockerfile 生成，修改公共构建逻辑后执行：
+Core 固定为 **ComfyUI v0.38.0**，基于固定 digest 的 cu130 镜像，需要 CUDA 13 兼容驱动、单个可见 GPU 和充足系统内存（建议 128GB）。固定配置的 Runpod Dockerfile 从根目录 Dockerfile 生成，修改公共构建逻辑后执行：
 
 ```bash
 python3 scripts/render_runpod_dockerfiles.py
@@ -55,7 +56,7 @@ python3 scripts/render_runpod_dockerfiles.py --check
 
 启动时按镜像代码/依赖指纹和 GPU 缓存键准备独立运行目录，校验代码文件，并始终使用镜像 Python。已有 `main.py`、旧虚拟环境和自定义节点保留在原位置；`input/output/user` 共享原数据目录。具体迁移与回退步骤见部署文档。
 
-两个固定镜像分别使用 `ADA_48_PRO` 和 `ADA_32_PRO`。通用完整模型卷 / Hub 入口支持这两个池和 `auto` 检测，不再锁定 `BLACKWELL_96`。官方公开池列表未给 48GB MIG 单独的 Serverless pool ID；MIG 使用精确 GPU 型号的 Pod/API 部署，勿猜造 pool ID。
+Ada 和 5090 镜像分别使用 `ADA_48_PRO` 和 `ADA_32_PRO`。通用完整模型卷 / Hub 入口支持这两个池和 `auto` 检测，不再锁定 `BLACKWELL_96`。官方公开池列表未给 48GB MIG 单独的 Serverless pool ID；MIG 使用精确 GPU 型号的 Pod/API 部署，勿猜造 pool ID。
 
 ## 调用
 
@@ -95,7 +96,7 @@ python3 scripts/render_runpod_dockerfiles.py --check
 - `MMH3_DOWNLOAD_SINGULARITY=true`：允许选择 Singularity v1.3 Pruned INT8。
 - `MMH3_DOWNLOAD_STYLE_LORAS=true`：允许 Singularity 的 `lora=realism/char_swap`。
 
-可选权重不会默认下载。卷模式下 `VOLUME_AUTOPOPULATE=false` 只关闭自动下载，启动仍检查所选权重存在；全镜像模式 `MMH3_MODEL_SOURCE=image` 不执行卷下载脚本，混合模式 `hybrid` 只下载卷中的两个 DiT；修改 GPU 配置、编码器或开启额外权重须重新打包。旧卷中的已有权重不会自动删除。ForgeHub 远程工作流同步默认关闭，显式设置 `WORKFLOW_SYNC_ENABLED=true` 才会同步。
+可选权重不会默认下载。卷模式下 `VOLUME_AUTOPOPULATE=false` 只关闭自动下载，启动仍检查所选权重存在；全镜像模式 `MMH3_MODEL_SOURCE=image` 不执行卷下载脚本，混合模式 `hybrid` 按镜像清单下载卷中的模型（紧凑 Ada 为编码器和两个 DiT，其余版本为两个 DiT）；修改 GPU 配置、编码器或开启额外权重须重新打包。旧卷中的已有权重不会自动删除。ForgeHub 远程工作流同步默认关闭，显式设置 `WORKFLOW_SYNC_ENABLED=true` 才会同步。
 
 ## 检查
 

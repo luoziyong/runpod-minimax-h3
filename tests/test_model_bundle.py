@@ -45,8 +45,14 @@ def make_bundle(root, profile=PROFILE, hybrid=False):
     return runtime, bundle, context, image, expected
 
 
-def make_native_bundle(root, profile=PROFILE):
+def make_native_bundle(root, profile=PROFILE, volume_encoder=False):
     runtime, _, context, _, expected = make_bundle(root, profile, hybrid=True)
+    if volume_encoder:
+        for (subdir, filename), data in expected.items():
+            if subdir == "text_encoders":
+                target = root / "volume/models" / subdir / filename
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(data)
     tools = root / "download-tools"
     tools.mkdir()
     (tools / "populate-volume.sh").write_text('''#!/bin/bash
@@ -55,7 +61,7 @@ python3 - <<'PY'
 import os,shutil
 from pathlib import Path
 rows=Path(os.environ['MANIFEST']).read_text().splitlines()
-assert len(rows)==5
+assert len(rows)==int(os.environ['FIXTURE_IMAGE_COUNT'])
 for row in rows:
     sub,name,url=row.split('\\t')
     assert sub!='diffusion_models'
@@ -70,8 +76,9 @@ PY
 ''')
     image = root / "native-image-models"
     with patch.object(model_bundle, "ROOT", tools), \
-            patch.dict(os.environ, FIXTURE_MODELS=str(root / "downloaded")):
-        bundle = model_bundle.bake_models(image, profile)
+            patch.dict(os.environ, FIXTURE_MODELS=str(root / "downloaded"),
+                       FIXTURE_IMAGE_COUNT="4" if volume_encoder else "5"):
+        bundle = model_bundle.bake_models(image, profile, volume_encoder=volume_encoder)
     return runtime, bundle, context, image, expected
 
 
@@ -280,11 +287,18 @@ class ModelBundleTests(unittest.TestCase):
             with self.subTest(profile=profile):
                 self.check_entrypoint(profile, hybrid=True, native=True)
 
-    def check_entrypoint(self, profile=PROFILE, hybrid=False, native=False):
+    def test_compact_native_entrypoint_downloads_encoder_and_dits_only(self):
+        self.check_entrypoint(hybrid=True, native=True, volume_encoder=True)
+
+    def check_entrypoint(self, profile=PROFILE, hybrid=False, native=False, volume_encoder=False):
         with tempfile.TemporaryDirectory(prefix="mmh3 image boot ") as directory:
             root = Path(directory)
             if native:
-                runtime, bundle, context, image, expected = make_native_bundle(root, profile)
+                runtime, bundle, context, image, expected = make_native_bundle(root, profile, volume_encoder)
+                if volume_encoder:
+                    self.assertEqual(len(bundle["models"]), 4)
+                    self.assertEqual(len(bundle["volume_models"]), 3)
+                    self.assertEqual({model["subdir"] for model in bundle["models"]}, {"vae", "loras"})
             else:
                 runtime, bundle, context, image, expected = make_bundle(root, profile, hybrid)
             baked, scripts = root / "baked", root / "scripts"
@@ -310,16 +324,16 @@ cuda = SimpleNamespace(is_available=lambda: True, device_count=lambda: 1,
             (scripts / "torch.py").write_text(torch_fixture)
             (scripts / "populate-volume.sh").write_text("#!/bin/sh\necho UNEXPECTED_DOWNLOAD >&2\nexit 88\n")
             if hybrid:
-                for path in (root / "volume/models/diffusion_models").iterdir():
-                    path.unlink()
+                for model in bundle["volume_models"]:
+                    (root / "volume/models" / model["subdir"] / model["filename"]).unlink()
                 (scripts / "populate-volume.sh").write_text('''#!/usr/bin/env python3
 import os,shutil
 from pathlib import Path
 rows=Path(os.environ['MANIFEST']).read_text().splitlines()
-assert len(rows)==2
+assert len(rows)==int(os.environ['FIXTURE_VOLUME_COUNT'])
 for row in rows:
     sub,name,url=row.split('\\t')
-    assert sub=='diffusion_models'
+    assert sub in ('diffusion_models','text_encoders')
     target=Path(os.environ['VOL_ROOT'])/'models'/sub/name
     target.parent.mkdir(parents=True,exist_ok=True)
     shutil.copyfile(Path(os.environ['FIXTURE_MODELS'])/sub/name,target)
@@ -336,6 +350,7 @@ print(json.dumps({'models_dir':runtime['models_dir'], 'model_source':runtime['mo
                        MMH3_DOWNLOAD_SINGULARITY="false", MMH3_DOWNLOAD_STYLE_LORAS="false",
                        MMH3_BAKED_MODELS_DIR=str(image), VOL_ROOT=runtime["volume_root"],
                        MMH3_LOCAL_ROOT=str(root / "local"), FIXTURE_MODELS=str(root / "downloaded"),
+                       FIXTURE_VOLUME_COUNT=str(len(bundle.get("volume_models", []))),
                        COMFYUI_BAKED_DIR=str(baked), COMFYUI_DIR=str(root / "workspace"),
                        MMH3_RUNTIME_CONFIG=str(root / "runtime/runtime.json"),
                        VOLUME_AUTOPOPULATE="true", WORKER_MODE="serverless", PYTHONDONTWRITEBYTECODE="1")
