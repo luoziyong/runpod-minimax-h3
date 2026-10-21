@@ -15,6 +15,10 @@ ARG MMH3_PLATFORM=linux/amd64
 FROM --platform=${MMH3_PLATFORM} huchukato/comfyui-base:cu130@sha256:9a913ebdc8eba4ad304efcd206871365e85236231404279591d968093432c151
 ARG COMFYUI_REF=v0.38.0
 ENV PATH="/opt/comfyui-baked/.venv-cu130/bin:${PATH}"
+# The pinned base has torch 2.10.0+cu130, which requires cuda-bindings 13.0.3.
+# TensorRT node requirements must not upgrade it to the latest CUDA release.
+COPY deploy/constraints-cu130.txt /opt/serverless/constraints-cu130.txt
+ENV PIP_CONSTRAINT="/opt/serverless/constraints-cu130.txt"
 
 # The INT8 video VAE and stage gates require a known ComfyUI core. Keep
 # custom_nodes/models supplied by the base, but replace the core sources.

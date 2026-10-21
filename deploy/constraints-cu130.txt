@@ -1,0 +1,3 @@
+# Match the CUDA bindings required by PyTorch in the pinned cu130 base image.
+cuda-python==13.0.3
+cuda-bindings==13.0.3
