@@ -1,0 +1,10 @@
+
+# CPU-only lifecycle probe on the production RTX 5090 runtime environment.
+# Build by appending this file to the repository root Dockerfile.
+COPY deploy/pod-benchmark/ /opt/pod-benchmark/
+ENV MMH3_GPU_PROFILE="rtx5090_32" MMH3_MODEL_SOURCE="volume" \
+    MMH3_ENCODER_FAMILY="official" VOL_ROOT="/workspace" \
+    HF_HUB_DISABLE_XET="1" HF_HUB_ENABLE_HF_TRANSFER="0" \
+    HF_HUB_DISABLE_PROGRESS_BARS="1" HF_HOME="/tmp/mmh3-hf" \
+    BENCH_VOLUME="/workspace" BENCH_TIMEOUT_SECONDS="1800"
+ENTRYPOINT ["python3", "-u", "/opt/pod-benchmark/benchmark.py"]
