@@ -5,6 +5,7 @@ import importlib.metadata
 import json
 import os
 import platform
+import re
 import shutil
 import signal
 import subprocess
@@ -55,11 +56,16 @@ def disk_snapshot(stage, volume, models):
 def download(model, root):
     from huggingface_hub import hf_hub_download
     result = {}
+    expected_source = f"{model['subdir']}/{model['filename']}"
+    if model["source_path"] not in (model["filename"], expected_source):
+        raise ValueError("Unexpected upstream model layout")
+    # LightX2V stores its LoRA at the repository root; Comfy-Org uses subfolders.
+    local_dir = root / model["subdir"] if model["source_path"] == model["filename"] else root
 
     def fetch():
         try:
             result["path"] = hf_hub_download(repo_id=model["repo"], revision=model["revision"],
-                                              filename=model["source_path"], local_dir=root)
+                                              filename=model["source_path"], local_dir=local_dir)
         except BaseException as exc:
             result["error"] = exc
 
@@ -76,6 +82,30 @@ def download(model, root):
     if Path(result["path"]) != expected or expected.stat().st_size != model["size"]:
         raise RuntimeError(f"Downloaded file path or size mismatch: {expected}")
     return round(time.monotonic() - start, 3)
+
+
+def reset_test_models_once(volume, models, state_dir, manifest):
+    token = os.environ.get("BENCH_RESET_MODELS_ONCE", "")
+    if not token:
+        return False
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", token):
+        raise ValueError("Invalid reset token")
+    receipt = state_dir / f"reset-{token}.json"
+    if receipt.exists():
+        return False
+    if models.is_symlink() or models.resolve() != volume.resolve() / "models" or not (state_dir / "volume-marker.json").is_file():
+        raise RuntimeError("Refusing to reset an unmarked or redirected model directory")
+    known = {m["filename"] for m in manifest["models"]}
+    for path in models.rglob("*"):
+        if path.is_symlink() or (path.is_file() and path.name not in known
+                                 and ".cache" not in path.relative_to(models).parts):
+            raise RuntimeError(f"Refusing to delete unexpected test-volume data: {path}")
+    emit("cold_cache_reset_start", token=token)
+    shutil.rmtree(models)
+    models.mkdir()
+    receipt.write_text(json.dumps(dict(run_id=RUN_ID, utc=utc(), token=token)))
+    emit("cold_cache_reset_complete", token=token, model_count=0)
+    return True
 
 
 def get_json(path):
@@ -118,6 +148,8 @@ def main():
          scope="CPU mode; no CUDA initialization, model tensor loading or video generation")
     disk_snapshot("before_models", volume, models)
     manifest = json.loads(Path(__file__).with_name("models.json").read_text())
+    if reset_test_models_once(volume, models, state_dir, manifest):
+        disk_snapshot("after_cold_cache_reset", volume, models)
     sys.path.insert(0, "/opt/serverless")
     import worker_config
     import runtime_workspace
